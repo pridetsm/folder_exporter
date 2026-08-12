@@ -1,0 +1,43 @@
+# ---------------------------------------------------------------------------
+# Add this to the scrape_configs: section of prometheus.yml on the PROMETHEUS
+# SERVER (not on the machine running the exporter).
+#
+# Match scrape_interval to scan_interval_seconds in folder_exporter.yml.
+# Scraping faster than the exporter scans just re-reads the same cached values;
+# scraping slower throws scans away.
+# ---------------------------------------------------------------------------
+
+scrape_configs:
+  - job_name: folder_exporter
+    scrape_interval: 10s
+    scrape_timeout: 5s
+    metrics_path: /metrics
+
+    static_configs:
+      # One entry per server running folder_exporter.
+      - targets:
+          - fileserver01.example.com:9847
+          - fileserver02.example.com:9847
+        labels:
+          environment: production
+
+    # Optional: only if basic_auth is configured in folder_exporter.yml
+    # basic_auth:
+    #   username: prometheus
+    #   password: <password>
+
+    # Optional: the `path` label is useful but long, and every folder already
+    # has a short unique `target` label. Uncomment to drop it and shrink the
+    # series.
+    # metric_relabel_configs:
+    #   - regex: 'path'
+    #     action: labeldrop
+
+    # Optional: strip the port from `instance`, leaving the bare hostname.
+    # Leave it in if the same host also runs other exporters, so the two stay
+    # distinguishable.
+    # relabel_configs:
+    #   - source_labels: [__address__]
+    #     regex: '([^:]+)(:[0-9]+)?'
+    #     target_label: instance
+    #     replacement: '${1}'

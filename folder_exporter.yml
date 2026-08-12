@@ -1,0 +1,185 @@
+# ============================================================================
+#  folder_exporter configuration
+#
+#  This exporter reports on THIS SERVER ONLY. Add the local folders you want
+#  monitored under "folders:" at the bottom. Network (UNC) paths and mapped
+#  network drives are rejected - run an instance on the server that owns the
+#  storage instead.
+#
+#  The file is watched: save it and the configuration reloads automatically,
+#  with no restart and without losing the added/removed counters.
+#  Validate before deploying with:   folder_exporter.exe --check-config
+# ============================================================================
+
+# ---------------------------------------------------------------------------
+# Server settings
+# ---------------------------------------------------------------------------
+
+# Where this exporter listens for Prometheus scrapes.
+#   0.0.0.0:9847   all interfaces (needs Administrator, or a netsh urlacl)
+#   127.0.0.1:9847 loopback only, if Prometheus runs on this same server
+listen_address: 0.0.0.0:9847
+metrics_path: /metrics
+
+# How often folders are walked. Scrapes serve a cached result, so this - not
+# the Prometheus scrape interval - is what controls freshness and disk cost.
+#
+# 10s suits small queue folders: a scan of a few dozen files costs about a
+# millisecond and the process runs at low I/O priority anyway. Raise it for any
+# folder large enough that a walk is not free, or set scan_interval_seconds on
+# that folder alone.
+scan_interval_seconds: 10
+
+# Give up on a single folder after this long and report partial data.
+scan_timeout_seconds: 900
+
+# Folders scanned at the same time. Keep at 1 for a single physical disk.
+max_concurrent_scans: 1
+
+# Run at low CPU *and* low disk I/O priority so scans yield to real workloads.
+low_priority: true
+
+# Return freed memory to the OS after each scan cycle.
+trim_working_set: true
+
+# Optional pacing for very large trees: sleep N ms every M files. 0 disables.
+throttle_every_files: 0
+throttle_sleep_ms: 5
+
+# Logging. A Windows service has no console, so log_file is set by default -
+# without it a service that misbehaves leaves no trace. The directory is created
+# automatically. The file rotates to exporter.log.1 at log_max_bytes.
+log_level: info                 # error | warn | info | debug
+log_file: C:\ProgramData\folder_exporter\exporter.log
+log_max_bytes: 8388608
+
+# Optional scrape authentication. Leave username empty to disable.
+basic_auth:
+  username: ""
+  password: ""
+
+# Buckets for the folder_file_age_seconds histogram: 5m, 15m, 30m, 1h, 6h, 1d,
+# 7d, 30d. A dashboard asking "how many files are past 15 minutes" can only be
+# answered at a boundary that exists here, so add one for any threshold you
+# intend to report on.
+file_age_buckets_seconds: [300, 900, 1800, 3600, 21600, 86400, 604800, 2592000]
+
+# ---------------------------------------------------------------------------
+# Defaults applied to every folder below. Any folder can override any of these.
+# ---------------------------------------------------------------------------
+defaults:
+  recursive: true
+  max_depth: 0                  # 0 = unlimited, 1 = the folder itself only
+  include: []                   # e.g. ["*.csv", "*.xml"] - empty means all files
+  exclude: ["*.tmp", "~$*"]
+  exclude_directories: []       # directory names skipped entirely
+  follow_reparse_points: false  # junctions/symlinks skipped: prevents loops
+  skip_hidden: false
+  skip_system: false
+
+  # Add/remove detection.
+  #   hash - keeps a 64-bit hash per file (cheapest, ~24 bytes per file)
+  #   name - also keeps the relative path, which is what lets the exporter
+  #          report the NAME of a removed file
+  track_changes: true
+  change_tracking_mode: hash
+  max_tracked_files: 5000000
+
+  # Emit filenames as label values. Off by default: filenames are
+  # high-cardinality labels in Prometheus.
+  expose_filename_labels: false
+
+  disk_metrics: true            # free/total bytes of the containing volume
+  extension_metrics: false      # per-extension file counts and sizes
+  top_extensions: 10
+
+  age_basis: write              # write = last write time, create = creation time
+
+# ---------------------------------------------------------------------------
+# THE FOLDERS TO MONITOR - replace these examples with your own.
+#
+#   name:  becomes the `target` label in Prometheus. Must be unique.
+#   path:  an absolute local path on this server. %EnvironmentVariables% work.
+#
+# Every key from "defaults" above can be repeated here to override it for one
+# folder, and `labels` adds any static labels you like to that folder's series.
+#
+# The examples below are integration queue folders: directories where one system
+# drops files for another to pick up. That is what this exporter is built for -
+# a queue that stops draining is a consumer that has stopped running, and the
+# metrics that matter are folder_files (how deep), folder_oldest_file_age_seconds
+# (is anything stuck) and folder_files_removed_total (is it still flowing).
+#
+# recursive: false is set on each of them deliberately. A queue folder's count
+# should reflect what is WAITING; if the consumer archives into a subfolder,
+# recursing would fold the archive into the backlog and the folder would look
+# permanently full.
+#
+# The source / via / destination labels describe the leg of a pipeline each
+# folder holds, so a dashboard can show where a stuck file was going and PromQL
+# can ask things like "everything inbound to the core system"
+# (destination="core") or "every leg that crosses the gateway" (via="gateway").
+# A folder with no `via` is a direct hand-off - leave it out rather than writing
+# "direct", so consumers can draw a two-stop path instead of inventing a hop.
+# ---------------------------------------------------------------------------
+folders:
+
+  # Inbound from an upstream system, translated by a gateway on the way in.
+  - name: INBOUND.A
+    path: C:\data\inbound\a
+    recursive: false
+    include: ["*.xml"]
+    labels:
+      direction: in
+      source: upstream
+      via: gateway
+      destination: core
+
+  # The same leg in a different message format, so the two are distinguishable.
+  - name: INBOUND.B
+    path: C:\data\inbound\b
+    recursive: false
+    labels:
+      direction: in
+      format: legacy
+      source: upstream
+      via: gateway
+      destination: core
+
+  # Everything the core system sends upstream leaves through here.
+  - name: OUTBOUND
+    path: C:\data\outbound
+    recursive: false
+    labels:
+      direction: out
+      source: core
+      via: gateway
+      destination: upstream
+
+  # A direct feed - no gateway, so no `via`.
+  - name: DIRECT.IN
+    path: C:\data\direct_in
+    recursive: false
+    labels:
+      direction: in
+      source: partner
+      destination: core
+
+  # Not a queue at all: a log directory, watched for growth rather than backlog.
+  - name: app_logs
+    path: '%SystemDrive%\inetpub\logs\LogFiles'
+    recursive: true
+    track_changes: false        # saves memory on a large tree
+    extension_metrics: true
+
+# ---------------------------------------------------------------------------
+# Optional: to see the NAME of the file that most recently arrived or was
+# removed from a folder, add these two keys to that folder:
+#
+#     change_tracking_mode: name
+#     expose_filename_labels: true
+#
+# Off by default on purpose. Each distinct filename becomes its own Prometheus
+# time series, so on a folder with high churn that is a cardinality problem.
+# Enable it only where the filenames are few, or stable, or worth the cost.
+# ---------------------------------------------------------------------------

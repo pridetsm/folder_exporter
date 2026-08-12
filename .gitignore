@@ -1,0 +1,21 @@
+# ── Build output and deployment bundle ──────────────────────────────────────
+# releases/ is assembled by build.ps1 and holds the compiled binary plus the
+# REAL, filled-in configuration for whatever server it was built for. The
+# committed folder_exporter.yml at the repo root is the example; the copy under
+# releases/ is a live config and must never be committed.
+/releases/
+/bin/
+*.exe
+*.pdb
+
+# ── Runtime ─────────────────────────────────────────────────────────────────
+*.log
+*.log.1
+
+# ── OS / editor ─────────────────────────────────────────────────────────────
+Thumbs.db
+.DS_Store
+.vs/
+.vscode/
+.idea/
+.claude/

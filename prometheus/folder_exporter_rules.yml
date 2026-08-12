@@ -1,0 +1,170 @@
+# ---------------------------------------------------------------------------
+# Alerting rules for folder_exporter.
+# Reference this file from prometheus.yml:
+#
+#   rule_files:
+#     - folder_exporter_rules.yml
+#
+# Validate with:  promtool check rules folder_exporter_rules.yml
+# ---------------------------------------------------------------------------
+
+groups:
+  - name: folder_exporter
+    rules:
+
+      # ---- exporter health -------------------------------------------------
+
+      - alert: FolderExporterDown
+        expr: up{job="folder_exporter"} == 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "folder_exporter on {{ $labels.instance }} is not responding"
+          description: "Prometheus has not been able to scrape folder_exporter for 5 minutes."
+
+      - alert: FolderMissing
+        expr: folder_exists == 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Watched folder {{ $labels.target }} does not exist on {{ $labels.instance }}"
+          description: "{{ $labels.path }} is configured but missing or inaccessible."
+
+      - alert: FolderScanStale
+        expr: time() - folder_last_scan_timestamp_seconds > 900
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Folder {{ $labels.target }} has not been scanned for 15 minutes"
+          description: "Scans may be timing out or blocked on a slow/unreachable volume."
+
+      - alert: FolderScanErrors
+        expr: increase(folder_scan_errors_total[30m]) > 0
+        for: 5m
+        labels:
+          severity: info
+        annotations:
+          summary: "Scan errors on {{ $labels.target }} ({{ $labels.instance }})"
+          description: "Usually access-denied subdirectories. Check the exporter log."
+
+      # ---- pipeline stalled: nothing new is arriving -----------------------
+
+      - alert: NoNewFilesArriving
+        expr: folder_seconds_since_last_file_added > 3600
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "No new files in {{ $labels.target }} for over an hour"
+          description: "Last file arrived {{ $value | humanizeDuration }} ago in {{ $labels.path }}."
+
+      # Equivalent check that works from the first scrape, without waiting for
+      # the exporter to observe an arrival itself.
+      - alert: NewestFileTooOld
+        expr: folder_newest_file_age_seconds > 7200
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Newest file in {{ $labels.target }} is {{ $value | humanizeDuration }} old"
+
+      # ---- backlog: files are arriving but not being consumed --------------
+
+      - alert: FolderBacklogGrowing
+        expr: folder_files > 1000 and deriv(folder_files[30m]) > 0
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Backlog building up in {{ $labels.target }}: {{ $value }} files"
+          description: "File count is above 1000 and still rising - the consumer may be stuck."
+
+      - alert: StuckFilesInFolder
+        expr: folder_oldest_file_age_seconds > 86400 and folder_files > 0
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "A file has been sitting in {{ $labels.target }} for over a day"
+          description: "Oldest file age is {{ $value | humanizeDuration }}."
+
+      # Share of files older than one hour, straight from the age histogram.
+      - alert: TooManyAgingFiles
+        expr: >
+          (
+            folder_file_age_seconds_count
+            - folder_file_age_seconds_bucket{le="3600"}
+          )
+          / clamp_min(folder_file_age_seconds_count, 1) > 0.5
+        for: 30m
+        labels:
+          severity: info
+        annotations:
+          summary: "Over half the files in {{ $labels.target }} are more than an hour old"
+
+      # ---- size and capacity ----------------------------------------------
+
+      - alert: FolderTooLarge
+        expr: folder_size_bytes > 100 * 1024 * 1024 * 1024
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.target }} exceeds 100 GiB ({{ $value | humanize1024 }}B)"
+
+      - alert: FolderGrowthSpike
+        expr: increase(folder_size_bytes[1h]) > 10 * 1024 * 1024 * 1024
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.target }} grew by more than 10 GiB in an hour"
+
+      - alert: VolumeAlmostFull
+        expr: folder_volume_free_bytes / folder_volume_total_bytes < 0.10
+        for: 15m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Volume {{ $labels.volume }} on {{ $labels.instance }} is over 90% full"
+
+      # ---- unexpected deletions -------------------------------------------
+
+      - alert: MassFileDeletion
+        expr: increase(folder_files_removed_total[10m]) > 500
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $value }} files removed from {{ $labels.target }} in 10 minutes"
+          description: "Unexpected bulk deletion in {{ $labels.path }} on {{ $labels.instance }}."
+
+      # ---- data quality ----------------------------------------------------
+
+      - alert: FolderTrackingTruncated
+        expr: folder_tracking_truncated == 1
+        for: 15m
+        labels:
+          severity: info
+        annotations:
+          summary: "max_tracked_files reached for {{ $labels.target }}"
+          description: "Add/remove counts are unreliable. Raise max_tracked_files or narrow the include filters."
+
+  # -------------------------------------------------------------------------
+  # Recording rules: precompute the expressions dashboards query most often.
+  # -------------------------------------------------------------------------
+  - name: folder_exporter_recording
+    interval: 1m
+    rules:
+      - record: folder:file_arrival_rate_5m
+        expr: rate(folder_files_added_total[5m])
+
+      - record: folder:file_removal_rate_5m
+        expr: rate(folder_files_removed_total[5m])
+
+      - record: folder:mean_file_bytes
+        expr: folder_size_bytes / clamp_min(folder_files, 1)
+
+      - record: folder:volume_used_ratio
+        expr: 1 - (folder_volume_free_bytes / folder_volume_total_bytes)
