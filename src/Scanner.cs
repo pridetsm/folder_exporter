@@ -65,6 +65,15 @@ namespace FolderExporter
         public string LastAddedFile = "";
         public string LastRemovedFile = "";
 
+        // Event-driven throughput, from the watcher rather than the scan. These count
+        // every file that arrived or left, including ones whose whole life fell between
+        // two scans and which the scan-based counters above cannot see.
+        public long EventsArrived;
+        public long EventsDeparted;
+        public long EventsLost;
+        public bool WatcherActive;
+        public bool WatchEnabled;
+
         public long TrackedFiles;
         public bool TrackingTruncated;
         public bool TrackingEnabled;
@@ -101,6 +110,9 @@ namespace FolderExporter
         public double LastRemovedTs;
         public string LastAddedFile = "";
         public string LastRemovedFile = "";
+
+        /// <summary>Event-driven arrival/departure counting. Null when watch_events is off.</summary>
+        public FolderWatcher Watcher;
 
         private volatile ScanResult _last;
         public ScanResult Last { get { return _last; } }
@@ -142,6 +154,14 @@ namespace FolderExporter
             r.Path = t.Path;
             r.ExtraLabels = t.Labels;
             r.TrackingEnabled = t.TrackChanges;
+            r.WatchEnabled = t.WatchEvents;
+            if (state.Watcher != null)
+            {
+                r.EventsArrived = state.Watcher.Arrived;
+                r.EventsDeparted = state.Watcher.Departed;
+                r.EventsLost = state.Watcher.Lost;
+                r.WatcherActive = state.Watcher.Active;
+            }
             r.ExposeNames = t.ExposeFilenameLabels;
             r.AgeBucketBounds = _cfg.FileAgeBucketsSeconds;
             r.AgeBucketCounts = new long[_cfg.FileAgeBucketsSeconds.Length];

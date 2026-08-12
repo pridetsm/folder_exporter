@@ -77,6 +77,19 @@ defaults:
   skip_hidden: false
   skip_system: false
 
+  # Count files arriving and leaving from filesystem events as they happen, rather
+  # than by comparing one scan against the next.
+  #
+  # Leave this on. The scan can only see a file that was present when it ran, so a
+  # message that arrives and is consumed between two scans is invisible to it -
+  # never counted as added, never as removed. On a fast interface that is most of
+  # the traffic. The watcher sees every create, delete and rename whatever the
+  # file's lifetime, which is what makes throughput countable at all.
+  #
+  # It does not replace the scan: state (how many are waiting, how old the oldest
+  # is, how large) still comes from scanning. The two answer different questions.
+  watch_events: true
+
   # Add/remove detection.
   #   hash - keeps a 64-bit hash per file (cheapest, ~24 bytes per file)
   #   name - also keeps the relative path, which is what lets the exporter

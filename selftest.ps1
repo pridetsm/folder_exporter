@@ -137,6 +137,46 @@ try {
     Assert ($body2 -match 'folder_last_added_file_info\{[^}]*file="arrived\.csv"')  "added filename is exposed"
     Assert ($body2 -match 'folder_last_removed_file_info\{[^}]*file="f4\.csv"')     "removed filename is exposed"
 
+    Write-Host "`n== event-driven throughput ==" -ForegroundColor Cyan
+    # The case the scan CANNOT see: files whose entire life falls between two scans.
+    # On a fast interface that is most of the traffic, so this is what makes throughput
+    # countable at all.
+    $before = (Invoke-WebRequest "http://127.0.0.1:$Port/metrics" -UseBasicParsing).Content
+    $arrivedBefore = [int](Get-Metric $before 'folder_events_arrived_total' 'selftest')
+    $addedBefore   = [int](Get-Metric $before 'folder_files_added_total' 'selftest')
+    foreach ($i in 1..8) {
+        $f = Join-Path $data "flash$i.csv"
+        [System.IO.File]::WriteAllText($f, 'x')
+        [System.IO.File]::Delete($f)            # gone again immediately
+    }
+    Start-Sleep -Milliseconds 900               # no scan needed: counters are read live
+    $after = (Invoke-WebRequest "http://127.0.0.1:$Port/metrics" -UseBasicParsing).Content
+    Assert ((Get-Metric $after 'folder_events_arrived_total' 'selftest') -eq ($arrivedBefore + 8)) `
+           "8 files that never survived a scan are still counted as arrivals"
+    Assert ((Get-Metric $after 'folder_events_departed_total' 'selftest') -ge 8) `
+           "...and as departures"
+    Assert ((Get-Metric $after 'folder_files_added_total' 'selftest') -eq $addedBefore) `
+           "the scan-based counter correctly does NOT see them (it cannot)"
+    Assert ((Get-Metric $after 'folder_watcher_active' 'selftest') -eq 1) "a watcher is running"
+    Assert ((Get-Metric $after 'folder_events_lost_total' 'selftest') -eq 0) "no events were lost"
+
+    # An excluded file must not count, or throughput would include temp files that were
+    # never messages.
+    $arrivedNow = [int](Get-Metric $after 'folder_events_arrived_total' 'selftest')
+    [System.IO.File]::WriteAllText((Join-Path $data 'scratch.tmp'), 'x')
+    Start-Sleep -Milliseconds 700
+    $after2 = (Invoke-WebRequest "http://127.0.0.1:$Port/metrics" -UseBasicParsing).Content
+    Assert ((Get-Metric $after2 'folder_events_arrived_total' 'selftest') -eq $arrivedNow) `
+           "an excluded *.tmp file is not counted as an arrival"
+    # ...but renaming it INTO the matched set is a real arrival: that is how interfaces
+    # deliver atomically, and missing it would lose the message entirely.
+    [System.IO.File]::Move((Join-Path $data 'scratch.tmp'), (Join-Path $data 'delivered.csv'))
+    Start-Sleep -Milliseconds 700
+    $after3 = (Invoke-WebRequest "http://127.0.0.1:$Port/metrics" -UseBasicParsing).Content
+    Assert ((Get-Metric $after3 'folder_events_arrived_total' 'selftest') -eq ($arrivedNow + 1)) `
+           "renaming *.tmp into *.csv counts as one arrival (atomic delivery)"
+    [System.IO.File]::Delete((Join-Path $data 'delivered.csv'))
+
     Write-Host "`n== exposition format ==" -ForegroundColor Cyan
     $lines   = $body2 -split "`n" | Where-Object { $_.Trim().Length -gt 0 }
     $sample  = [regex]'^(?<n>[a-zA-Z_:][a-zA-Z0-9_:]*)(\{(?<l>.*)\})?\s(?<v>-?(\d+(\.\d+)?([eE][-+]?\d+)?|NaN|[-+]Inf))$'

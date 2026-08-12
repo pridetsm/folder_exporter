@@ -23,6 +23,7 @@ namespace FolderExporter
         public bool FollowReparsePoints;
         public bool SkipHidden;
         public bool SkipSystem;
+        public bool WatchEvents = true;
         public bool TrackChanges = true;
         public string ChangeTrackingMode = "hash";   // "hash" | "name"
         public bool ExposeFilenameLabels;
@@ -70,6 +71,7 @@ namespace FolderExporter
             t.FollowReparsePoints = FollowReparsePoints;
             t.SkipHidden = SkipHidden;
             t.SkipSystem = SkipSystem;
+            t.WatchEvents = WatchEvents;
             t.TrackChanges = TrackChanges;
             t.ChangeTrackingMode = ChangeTrackingMode;
             t.ExposeFilenameLabels = ExposeFilenameLabels;
@@ -270,6 +272,7 @@ namespace FolderExporter
             f.FollowReparsePoints = Bool(o, "follow_reparse_points", f.FollowReparsePoints);
             f.SkipHidden = Bool(o, "skip_hidden", f.SkipHidden);
             f.SkipSystem = Bool(o, "skip_system", f.SkipSystem);
+            f.WatchEvents = Bool(o, "watch_events", f.WatchEvents);
             f.TrackChanges = Bool(o, "track_changes", f.TrackChanges);
             f.ChangeTrackingMode = Str(o, "change_tracking_mode", f.ChangeTrackingMode).ToLowerInvariant();
             f.ExposeFilenameLabels = Bool(o, "expose_filename_labels", f.ExposeFilenameLabels);

@@ -18,10 +18,13 @@ namespace FolderExporter
            build a server is actually running — without it a deployment that silently did
            not happen looks identical to one that did.
 
+           1.2.0  event-driven throughput: folder_events_arrived_total /
+                  _departed_total, counted from filesystem events as they happen, so a
+                  file whose whole life falls between two scans is no longer invisible.
            1.1.0  fixed-cadence scan scheduling (was drifting: each cycle absorbed the
                   dispatch latency, so folders slid tens of seconds apart over a day);
                   --once no longer writes log lines to stdout; log directory is created. */
-        public const string Version = "1.1.0";
+        public const string Version = "1.2.0";
 
         public static string Render(IList<ScanResult> results, ExporterStats stats)
         {
@@ -93,6 +96,22 @@ namespace FolderExporter
 
             Family(sb, "folder_seconds_since_last_file_removed", "Seconds since a file was last observed being removed.", "gauge");
             foreach (var r in results) if (Tracked(r) && r.LastRemovedTs > 0) Sample(sb, "folder_seconds_since_last_file_removed", r, Math.Max(0, now - r.LastRemovedTs));
+
+            // ---------------- event-driven throughput ----------------
+            /* Counted by the watcher as Windows reports each create/delete/rename, so
+               unlike the scan-based counters above these see a file whose entire life fell
+               between two scans — which on a fast interface is most of the traffic. */
+            Family(sb, "folder_events_arrived_total", "Files observed arriving, counted from filesystem events as they happen.", "counter");
+            foreach (var r in results) if (Watched(r)) Sample(sb, "folder_events_arrived_total", r, r.EventsArrived);
+
+            Family(sb, "folder_events_departed_total", "Files observed leaving, counted from filesystem events as they happen.", "counter");
+            foreach (var r in results) if (Watched(r)) Sample(sb, "folder_events_departed_total", r, r.EventsDeparted);
+
+            Family(sb, "folder_events_lost_total", "Times the OS event buffer overflowed and events were discarded. Non-zero means the throughput counters under-report.", "counter");
+            foreach (var r in results) if (Watched(r)) Sample(sb, "folder_events_lost_total", r, r.EventsLost);
+
+            Family(sb, "folder_watcher_active", "1 if a filesystem watcher is currently running for this folder.", "gauge");
+            foreach (var r in results) if (Watched(r)) Sample(sb, "folder_watcher_active", r, r.WatcherActive ? 1 : 0);
 
             Family(sb, "folder_tracked_files", "Files currently held in the change-tracking index for this target.", "gauge");
             foreach (var r in results) if (Tracked(r)) Sample(sb, "folder_tracked_files", r, r.TrackedFiles);
@@ -250,6 +269,11 @@ namespace FolderExporter
             sb.Append("folder_exporter_managed_heap_bytes ").Append(GC.GetTotalMemory(false)).Append('\n');
 
             return sb.ToString();
+        }
+
+        private static bool Watched(ScanResult r)
+        {
+            return r.WatchEnabled;
         }
 
         private static bool Tracked(ScanResult r)

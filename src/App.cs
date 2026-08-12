@@ -87,6 +87,9 @@ namespace FolderExporter
             _running = false;
             try { _cancel.Cancel(); } catch { }
             if (_http != null) _http.Stop();
+            lock (_gate)
+                foreach (Entry e in _entries)
+                    if (e.State.Watcher != null) e.State.Watcher.Dispose();
             if (_loop != null) { try { _loop.Join(3000); } catch { } }
             _log.Info("folder_exporter stopped");
         }
@@ -102,6 +105,7 @@ namespace FolderExporter
             foreach (FolderConfig tc in cfg.Folders)
             {
                 var st = new TargetState(tc);
+                if (tc.WatchEvents) st.Watcher = new FolderWatcher(tc, _log);
 
                 if (previous != null)
                 {
@@ -126,6 +130,12 @@ namespace FolderExporter
             }
 
             lock (_gate) { _entries = list; }
+
+            // Dispose the outgoing watchers only after the new ones exist and have taken
+            // their counts across, so a reload never drops events into a gap.
+            if (previous != null)
+                foreach (Entry old in previous)
+                    if (old.State.Watcher != null) old.State.Watcher.Dispose();
         }
 
         private static void AdoptState(TargetState fresh, TargetState old, FolderConfig cfg)
@@ -139,6 +149,9 @@ namespace FolderExporter
             fresh.LastAddedFile = old.LastAddedFile;
             fresh.LastRemovedFile = old.LastRemovedFile;
             if (old.Last != null) fresh.Publish(old.Last);
+            // Throughput counts survive a saved YAML: they are the day's figures, and an
+            // edit to an unrelated folder should not reset them.
+            if (fresh.Watcher != null) fresh.Watcher.AdoptCountsFrom(old.Watcher);
 
             // The file index can only be reused when the tracking mode is unchanged.
             bool sameMode = old.Config.TrackChanges == cfg.TrackChanges &&
@@ -172,6 +185,9 @@ namespace FolderExporter
                         Interlocked.Increment(ref _activeScans);
                         ThreadPool.QueueUserWorkItem(RunScan, e);
                     }
+
+                    foreach (Entry e in snapshot)
+                        if (e.State.Watcher != null) e.State.Watcher.EnsureRunning();
 
                     CheckConfigFile();
                 }
@@ -293,7 +309,24 @@ namespace FolderExporter
             foreach (Entry e in snapshot)
             {
                 ScanResult r = e.State.Last;
-                if (r != null) { results.Add(r); continue; }
+                if (r != null)
+                {
+                    /* Refresh the event counters from the watcher at RENDER time, not scan
+                       time. They are the whole answer to "how much went through", and a
+                       file that arrives and leaves between two scans is exactly what they
+                       exist to catch — so publishing them only when a scan happens would
+                       reintroduce the very lag the watcher removes. They are monotonic, so
+                       reading them here is safe against a scan publishing concurrently. */
+                    if (e.State.Watcher != null)
+                    {
+                        r.EventsArrived = e.State.Watcher.Arrived;
+                        r.EventsDeparted = e.State.Watcher.Departed;
+                        r.EventsLost = e.State.Watcher.Lost;
+                        r.WatcherActive = e.State.Watcher.Active;
+                    }
+                    results.Add(r);
+                    continue;
+                }
                 // Not scanned yet: emit a placeholder so the target is visible immediately.
                 var pending = new ScanResult();
                 pending.TargetName = e.State.Config.Name;
