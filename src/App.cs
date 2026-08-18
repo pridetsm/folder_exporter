@@ -18,6 +18,7 @@ namespace FolderExporter
         private Config _cfg;
         private Scanner _scanner;
         private HttpServer _http;
+        private readonly Scheduler _scheduler;
         private readonly ExporterStats _stats = new ExporterStats();
 
         private readonly object _gate = new object();
@@ -42,12 +43,29 @@ namespace FolderExporter
             public int IntervalSeconds;
         }
 
-        public App(string configPath, bool console, Logger log)
+        private readonly bool _runJobs;
+
+        public App(string configPath, bool console, Logger log) : this(configPath, console, log, true) { }
+
+        /// <param name="runJobs">
+        /// False for one-shot, side-effect-free CLI modes (--once): the scheduler's
+        /// state is still loaded so its metrics render normally, but nothing is
+        /// executed. Without this, a cron entry that periodically ran --once to
+        /// scrape metrics would also fire any job that happened to be due during
+        /// that brief window - a surprising and hard-to-diagnose double-run.
+        /// </param>
+        public App(string configPath, bool console, Logger log, bool runJobs)
         {
             _configPath = configPath;
             _console = console;
             _log = log;
+            _runJobs = runJobs;
+            _scheduler = new Scheduler(log);
         }
+
+        /// <summary>The job scheduler, exposed for CLI verbs (--run-job) that need to
+        /// drive it directly without starting the full App.</summary>
+        public Scheduler Jobs { get { return _scheduler; } }
 
         public void Start()
         {
@@ -69,6 +87,7 @@ namespace FolderExporter
 
             _scanner = new Scanner(_cfg, _log);
             BuildEntries(_cfg, null);
+            if (_runJobs) _scheduler.Start(_cfg); else _scheduler.LoadOnly(_cfg);
 
             _http = new HttpServer(_log, RenderMetrics, RenderStatus, Reload);
             _http.Start(_cfg);
@@ -87,6 +106,7 @@ namespace FolderExporter
             _running = false;
             try { _cancel.Cancel(); } catch { }
             if (_http != null) _http.Stop();
+            _scheduler.Stop();
             lock (_gate)
                 foreach (Entry e in _entries)
                     if (e.State.Watcher != null) e.State.Watcher.Dispose();
@@ -281,6 +301,7 @@ namespace FolderExporter
                 _scanner = new Scanner(fresh, _log);
                 _log.Configure(fresh.LogLevel, fresh.LogFile, fresh.LogMaxBytes, _console);
                 BuildEntries(fresh, previous);
+                _scheduler.Reload(fresh);
                 _http.Configure(fresh);
                 Interlocked.Increment(ref _stats.ConfigReloads);
                 _log.Info("configuration reloaded: " + fresh.Folders.Count + " folder(s)");
@@ -298,7 +319,7 @@ namespace FolderExporter
         public string RenderMetrics()
         {
             Interlocked.Increment(ref _stats.Scrapes);
-            return Metrics.Render(CurrentResults(), _stats);
+            return Metrics.Render(CurrentResults(), _stats) + _scheduler.RenderMetrics(Scanner.Now());
         }
 
         private List<ScanResult> CurrentResults()
@@ -374,7 +395,9 @@ namespace FolderExporter
                 sb.Append("<td>").Append(r.ScanTimestamp > 0 ? HumanAge(now - r.ScanTimestamp) + " ago" : "-").Append("</td>");
                 sb.Append("<td>").Append(r.ScanDurationSeconds.ToString("0.000", CultureInfo.InvariantCulture)).Append("s</td></tr>");
             }
-            sb.Append("</table></body></html>");
+            sb.Append("</table>");
+            _scheduler.RenderStatusRows(sb, now);
+            sb.Append("</body></html>");
             return sb.ToString();
         }
 

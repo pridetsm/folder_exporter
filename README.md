@@ -2,7 +2,9 @@
 
 A Prometheus exporter for **Windows file and folder metrics**: folder size, file
 count, folder age, oldest/newest file, and detection of files being **added** and
-**removed**.
+**removed** — with a built-in **job scheduler** for running scripts on a cron or
+interval schedule from the same config, immune to whatever disturbs Task
+Scheduler.
 
 Single `.exe`, ~70 KB, configured by one **YAML file**, **no runtime to install** —
 it builds with the C# compiler that already ships inside Windows, and runs on any
@@ -25,6 +27,7 @@ storage, run an instance on that file server.
   - [Foreground](#foreground)
   - [As a Windows service](#as-a-windows-service)
   - [Firewall and URL binding](#firewall-and-url-binding)
+- [Job scheduling](#job-scheduling)
 - [Connecting it to Prometheus](#connecting-it-to-prometheus)
 - [Metrics reference](#metrics-reference)
 - [Useful PromQL](#useful-promql)
@@ -263,6 +266,117 @@ an existing agent or reverse proxy on the host.
 
 ---
 
+## Job scheduling
+
+Version 2.0 adds a built-in job scheduler: run scripts on a cron or interval
+schedule, defined in the same `folder_exporter.yml`, executed by this same
+Windows service.
+
+**Why this exists.** Scheduled tasks that live in Task Scheduler get reset,
+disabled, or removed by configuration-management baselines, GPO drift, and
+routine preventive maintenance - the task engine is a common target for that
+kind of housekeeping. A service is not: it is not a scheduled task, so nothing
+that resets tasks touches it. If your scripts have been getting silently
+dropped by maintenance windows, moving them here is the fix.
+
+### Configuring jobs
+
+```yaml
+job_poll_interval_seconds: 15
+job_state_file: C:\ProgramData\folder_exporter\jobs\state.tsv
+job_log_directory: C:\ProgramData\folder_exporter\jobs\logs
+
+job_defaults:
+  shell: auto
+  timeout_seconds: 3600
+  if_running: skip
+  on_missed: run_once
+  missed_grace_seconds: 7200
+
+jobs:
+  - name: nightly_reconciliation
+    cron: "30 2 * * *"                 # 5-field cron, local time
+    command: C:\scripts\Reconcile.ps1
+    timeout_seconds: 5400
+
+  - name: queue_sweep
+    every_seconds: 300                 # or a fixed interval instead of cron
+    command: C:\scripts\Sweep.ps1
+    args: ["-Mode", "quick"]
+    on_missed: skip
+```
+
+See the fully-commented `job_defaults:` and `jobs:` sections in
+`folder_exporter.yml` for every key. `job_defaults` works exactly like the
+folder `defaults:` block: any key can be overridden per job.
+
+A script's arguments are always passed as discrete argv entries, never
+concatenated into a shell string - `args: ["-Path", "$(Get-Something)"]`
+reaches the script as literal text, not something a shell re-interprets.
+`shell: auto` runs `.ps1` under PowerShell, `.bat`/`.cmd` under `cmd`, and
+anything else directly with no shell involved at all.
+
+### What happens on a reboot or an outage
+
+The scheduler persists each job's last-checked and last-due time to
+`job_state_file` after every run. On restart it compares that against the
+current time and decides what to do about anything it missed, per
+`on_missed`:
+
+| `on_missed` | Behavior |
+|---|---|
+| `skip` | Don't catch up - wait for the next natural occurrence. Right for anything sub-hourly, where a missed run is moot by the time anyone would notice. |
+| `run_once` (default) | Run only the most recent missed occurrence, drop the rest. Right for "current state of the world" jobs (reconciliation, a report). |
+| `run_all` | Run every missed occurrence, oldest first, capped at 20 so a long outage cannot turn into an unbounded burst. Right for jobs where each occurrence is distinct work that must not be dropped. |
+
+This only applies to a genuine backlog (more than one occurrence found in a
+single check - the service was down, or a run overran). A job firing on time
+always runs regardless of `on_missed`.
+
+`missed_grace_seconds` bounds how far back the scheduler will even look:
+occurrences older than that are logged and counted in
+`scheduler_job_missed_total`, not individually replayed.
+
+### Process isolation and timeouts
+
+Each run executes inside a Windows job object, so `timeout_seconds` kills the
+**entire process tree** - a script's child processes included, not just the
+immediate one - rather than leaving orphans running after the parent is gone.
+
+`if_running` controls what happens if a job comes due while its previous run
+is still going: `skip` (default) drops the new occurrence and logs a warning;
+`queue` runs it again immediately once the current run finishes.
+
+### Testing a job without waiting for its schedule
+
+```powershell
+folder_exporter.exe --run-job nightly_reconciliation --config folder_exporter.yml
+```
+
+Runs once, synchronously, prints the result, and exits. It respects
+`if_running` (won't clobber a run already in progress) and updates the same
+state and metrics a scheduled run would, so a manual test integrates with
+monitoring the same way. There is deliberately no HTTP endpoint to trigger a
+job - only local console/service access can do that.
+
+### Job logs
+
+Each run's stdout/stderr is written to
+`job_log_directory\<job name>\<timestamp>.log`, keeping the most recent 20
+runs per job. Set `job_log_directory: ""` to disable.
+
+### What this does not do
+
+There is no per-job identity (`run_as`) - every job runs as whatever account
+the `folder_exporter` service itself runs as. If different jobs genuinely need
+different privileges, that is a reason to run a second instance of the
+service under a different account with its own config, not a feature this
+version adds. The default LocalSystem account can reach local resources; give
+the service a dedicated account (see [Running it](#running-it)) if jobs need
+network credentials LocalSystem doesn't have.
+
+---
+
 ## Connecting it to Prometheus
 
 Add this to the `scrape_configs:` section of `prometheus.yml`
@@ -412,6 +526,25 @@ plus any static `labels` you defined.
 `folder_exporter_cpu_seconds_total`, `folder_exporter_open_handles`,
 `folder_exporter_managed_heap_bytes`.
 
+### Job scheduler
+
+All carry a `job` label (the configured job name).
+
+| Metric | Type | Description |
+|---|---|---|
+| `scheduler_up` | gauge | 1 if the scheduler loop is running |
+| `scheduler_jobs_configured` | gauge | Number of jobs configured and enabled |
+| `scheduler_job_running` | gauge | 1 if that job is executing right now |
+| `scheduler_job_last_start_timestamp_seconds` | gauge | When it last started |
+| `scheduler_job_last_end_timestamp_seconds` | gauge | When it last finished |
+| `scheduler_job_last_success_timestamp_seconds` | gauge | When it last exited 0 |
+| `scheduler_job_last_exit_code` | gauge | Exit code of the last completed run; `-1` if never run |
+| `scheduler_job_last_duration_seconds` | gauge | Wall-clock duration of the last run |
+| `scheduler_job_last_due_timestamp_seconds` | gauge | Scheduled time of the last run attempted |
+| `scheduler_job_next_due_timestamp_seconds` | gauge | Best-effort estimate of the next scheduled run |
+| `scheduler_job_runs_total{result}` | counter | Completed runs, by `ok`/`failed`/`timeout`/`overlap_skipped` |
+| `scheduler_job_missed_total` | counter | Occurrences dropped by `on_missed` or the catch-up grace window |
+
 ---
 
 ## Useful PromQL
@@ -472,9 +605,15 @@ these metrics exist to catch:
 | `VolumeAlmostFull` | Containing volume over 90% full |
 | `MassFileDeletion` | Over 500 files removed in 10 minutes |
 | `FolderTrackingTruncated` | The tracking cap was hit |
+| `SchedulerDown` | The job scheduler loop is not running |
+| `JobFailed` / `JobTimedOut` | A job exited non-zero, or was killed for running over `timeout_seconds` |
+| `JobNeverSucceeded` | A job has run but never once exited 0 |
 
 Thresholds are deliberately generic — tune them per folder, most simply by
-adding a `labels` entry in the config and matching on it in the rule.
+adding a `labels` entry in the config and matching on it in the rule. A job's
+own expected cadence is not generic, though: copy the commented
+`NightlyReconciliationStale`-style example in the rules file per job you want
+staleness-alerted, rather than trying to write one rule that fits every job.
 
 ---
 
@@ -549,6 +688,20 @@ the wrong tool — use a NAS-native exporter or SNMP.
 bucket, per extension, and per filename label if enabled. A hundred targets is
 comfortable; ten thousand distinct filenames per hour is not.
 
+**Jobs inherit the service account, with everything that implies.** A script
+that works when you run it interactively may behave differently under the
+service: no mapped drives, no interactive desktop, a different `%TEMP%`, and
+whatever network access that account happens to have. Use UNC paths instead of
+drive letters in job scripts, and give the service a dedicated account (see
+[Running it](#running-it)) if a job needs credentials LocalSystem lacks.
+
+**Cron matching is wall-clock local time, evaluated each poll tick** - the same
+way `cron` itself works - not precomputed "next fire" arithmetic. A job
+scheduled for a local time that does not exist that day (the spring-forward
+gap) is silently skipped once; a local time that occurs twice (the fall-back
+overlap) can fire twice. This is standard cron behavior, not unique to this
+exporter, and affects at most one occurrence, once a year.
+
 ---
 
 ## Troubleshooting
@@ -564,6 +717,9 @@ comfortable; ten thousand distinct filenames per hour is not.
 | `folder_scan_timed_out` is 1 | Tree is too big or too slow for `scan_timeout_seconds`. Raise it, narrow `include`/`exclude_directories`, or lengthen the scan interval |
 | Add/remove counts look wrong | Check `folder_tracking_truncated`; if 1, raise `max_tracked_files`. Also confirm `track_changes` is on for that folder |
 | Removed *filenames* missing | Requires `change_tracking_mode: "name"` — `hash` mode cannot recover a name it no longer holds |
+| A job never seems to run | Check `--check-config` output for it, confirm `cron`/`every_seconds` is set correctly, and check `scheduler_job_last_start_timestamp_seconds` — `--run-job <name>` runs it immediately for a quick test |
+| A job that works interactively fails as a service | Almost always mapped drives or a working directory the service account can't see — see [Operational notes](#operational-notes-and-limits) |
+| A job silently didn't catch up after a reboot | Check `scheduler_job_missed_total` and the job's `on_missed`/`missed_grace_seconds` — `skip` and a short grace window both intentionally drop old occurrences |
 | Service starts then stops immediately | Bad config or a bind failure. Set `log_file` and read it; also check Event Viewer → Windows Logs → Application |
 | Memory grows over time | Almost always the tracking index on a folder with millions of files. Set `track_changes: false` or lower `max_tracked_files` |
 
@@ -578,6 +734,7 @@ total, additions, removals and duration.
 folder_exporter.exe [--config <path>]      Run in the foreground (Ctrl+C to stop)
 folder_exporter.exe --once                 Scan once, print metrics to stdout, exit
 folder_exporter.exe --check-config         Validate the config file and exit
+folder_exporter.exe --run-job <name>       Run one configured job immediately and exit
 folder_exporter.exe --install              Install as a Windows service (elevated)
 folder_exporter.exe --uninstall            Remove the Windows service (elevated)
 folder_exporter.exe --version              Print the version
@@ -587,6 +744,12 @@ folder_exporter.exe --version              Print the version
   --console              Force console mode even when not interactive
 ```
 
+`--once` never executes jobs - it still renders `scheduler_job_*` metrics from
+persisted state, but does not run the scheduler loop. That matters if you were
+ever tempted to drive `--once` from an external scheduled task: doing so would
+not double-run anything, but it also would not run jobs at all - `--once` is
+scrape-only by design. Use the actual service for that.
+
 ### HTTP endpoints
 
 | Path | Purpose |
@@ -594,7 +757,11 @@ folder_exporter.exe --version              Print the version
 | `/metrics` | Prometheus exposition (gzip when the client accepts it) |
 | `/healthz` | Liveness probe, returns `ok` |
 | `/-/reload` | `POST` to reload the configuration |
-| `/` | HTML status page listing every watched folder |
+| `/` | HTML status page listing every watched folder and every scheduled job |
+
+There is intentionally no HTTP endpoint to trigger a job. Use
+`--run-job <name>` from an elevated/local session instead - see
+[Job scheduling](#job-scheduling).
 
 ### Project layout
 
@@ -610,12 +777,17 @@ folder-exporter/
 │   ├── Program.cs             Entry point, CLI, Windows service host
 │   ├── App.cs                 Scan scheduling, hot reload, status page
 │   ├── Scanner.cs             Directory walker and change detection
-│   ├── Metrics.cs             Prometheus exposition rendering
+│   ├── Watcher.cs             Filesystem event watcher (add/remove throughput)
+│   ├── Metrics.cs             Prometheus exposition rendering (folder_*)
+│   ├── Scheduler.cs           Job scheduler: catch-up, dispatch, scheduler_* metrics
+│   ├── Cron.cs                5-field cron expression matching
+│   ├── JobRunner.cs           Process execution, argv escaping, job-object kill-tree
+│   ├── JobStateStore.cs       Persisted per-job state (survives restart/reboot)
 │   ├── HttpServer.cs          HttpListener front end
 │   ├── Config.cs              Config mapping and local-path enforcement
 │   ├── Yaml.cs                YAML subset parser
 │   ├── Logger.cs              Level-filtered logging with rotation
-│   └── Win32.cs               FindFirstFileEx and other native interop
+│   └── Win32.cs               FindFirstFileEx, job objects, other native interop
 ├── prometheus/
 │   ├── prometheus-scrape-config.yml
 │   └── folder_exporter_rules.yml

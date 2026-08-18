@@ -18,13 +18,18 @@ namespace FolderExporter
            build a server is actually running — without it a deployment that silently did
            not happen looks identical to one that did.
 
+           2.0.0  built-in job scheduler: cron or interval jobs defined under "jobs:" in
+                  the same config, run by the same Windows service - a script's schedule
+                  now survives whatever disturbs Task Scheduler, and a reboot resumes
+                  from persisted state instead of silently dropping missed runs. Adds
+                  scheduler_job_* / scheduler_up metrics and the --run-job CLI verb.
            1.2.0  event-driven throughput: folder_events_arrived_total /
                   _departed_total, counted from filesystem events as they happen, so a
                   file whose whole life falls between two scans is no longer invisible.
            1.1.0  fixed-cadence scan scheduling (was drifting: each cycle absorbed the
                   dispatch latency, so folders slid tens of seconds apart over a day);
                   --once no longer writes log lines to stdout; log directory is created. */
-        public const string Version = "1.2.0";
+        public const string Version = "2.0.0";
 
         public static string Render(IList<ScanResult> results, ExporterStats stats)
         {

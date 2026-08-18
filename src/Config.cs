@@ -86,6 +86,41 @@ namespace FolderExporter
         }
     }
 
+    public sealed class JobConfig
+    {
+        public string Name;
+        public bool Enabled = true;
+        public string Cron = "";           // 5-field cron; mutually exclusive with EverySeconds
+        public int EverySeconds;
+        public string Command = "";
+        public List<string> Args = new List<string>();
+        public string Shell = "auto";      // auto | powershell | cmd | exe
+        public string WorkingDirectory = "";
+        public int TimeoutSeconds = 3600;
+        public string IfRunning = "skip";      // skip | queue
+        public string OnMissed = "run_once";   // skip | run_once | run_all
+        public int MissedGraceSeconds = 7200;
+        public Dictionary<string, string> Env = new Dictionary<string, string>();
+
+        public JobConfig CloneFrom()
+        {
+            var j = new JobConfig();
+            j.Enabled = Enabled;
+            j.Cron = Cron;
+            j.EverySeconds = EverySeconds;
+            j.Command = Command;
+            j.Args = new List<string>(Args);
+            j.Shell = Shell;
+            j.WorkingDirectory = WorkingDirectory;
+            j.TimeoutSeconds = TimeoutSeconds;
+            j.IfRunning = IfRunning;
+            j.OnMissed = OnMissed;
+            j.MissedGraceSeconds = MissedGraceSeconds;
+            j.Env = new Dictionary<string, string>(Env);
+            return j;
+        }
+    }
+
     public sealed class Config
     {
         public string ListenAddress = "0.0.0.0:9847";
@@ -105,6 +140,12 @@ namespace FolderExporter
         public string BasicAuthPassword = "";
         public double[] FileAgeBucketsSeconds = new double[] { 300, 3600, 21600, 86400, 604800, 2592000 };
         public List<FolderConfig> Folders = new List<FolderConfig>();
+
+        public int JobPollIntervalSeconds = 15;
+        public string JobStateFile = @"C:\ProgramData\folder_exporter\jobs\state.tsv";
+        public string JobLogDirectory = @"C:\ProgramData\folder_exporter\jobs\logs";
+        public List<JobConfig> Jobs = new List<JobConfig>();
+
         public string SourcePath = "";
         public DateTime SourceStamp;
 
@@ -211,7 +252,95 @@ namespace FolderExporter
                 f.Prepare();
                 c.Folders.Add(f);
             }
+
+            c.JobPollIntervalSeconds = Math.Max(5, Int(root, "job_poll_interval_seconds", c.JobPollIntervalSeconds));
+            c.JobStateFile = Str(root, "job_state_file", c.JobStateFile);
+            c.JobLogDirectory = Str(root, "job_log_directory", c.JobLogDirectory);
+            if (c.JobStateFile.Length > 0) c.JobStateFile = Environment.ExpandEnvironmentVariables(c.JobStateFile);
+            if (c.JobLogDirectory.Length > 0) c.JobLogDirectory = Environment.ExpandEnvironmentVariables(c.JobLogDirectory);
+
+            var jobDefaults = new JobConfig();
+            Dictionary<string, object> jobDefMap = Map(root, "job_defaults");
+            if (jobDefMap != null) ApplyJob(jobDefaults, jobDefMap);
+
+            List<object> jobs = List(root, "jobs");
+            if (jobs != null)
+            {
+                var seenJobs = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                foreach (object o in jobs)
+                {
+                    Dictionary<string, object> jo = Yaml.AsMap(o);
+                    if (jo == null)
+                        throw new Exception("each entry under \"jobs:\" must be a mapping with at least a \"name:\" and \"command:\"");
+
+                    JobConfig j = jobDefaults.CloneFrom();
+                    ApplyJob(j, jo);
+
+                    if (string.IsNullOrEmpty(j.Name))
+                        throw new Exception("a job entry is missing its \"name:\"");
+                    if (!seenJobs.Add(j.Name))
+                        throw new Exception("duplicate job name \"" + j.Name + "\" - names must be unique");
+                    if (string.IsNullOrEmpty(j.Command))
+                        throw new Exception("job \"" + j.Name + "\" is missing its \"command:\"");
+
+                    bool hasCron = !string.IsNullOrEmpty(j.Cron);
+                    bool hasEvery = j.EverySeconds > 0;
+                    if (hasCron == hasEvery)
+                        throw new Exception("job \"" + j.Name + "\" must set exactly one of \"cron:\" or \"every_seconds:\"");
+                    if (hasCron)
+                    {
+                        try { CronSchedule.Validate(j.Cron); }
+                        catch (Exception ex) { throw new Exception("job \"" + j.Name + "\" has an invalid cron expression \"" + j.Cron + "\": " + ex.Message); }
+                    }
+
+                    j.Shell = NormalizeJobEnum(j.Shell, "shell", j.Name, "auto", "powershell", "cmd", "exe");
+                    j.IfRunning = NormalizeJobEnum(j.IfRunning, "if_running", j.Name, "skip", "queue");
+                    j.OnMissed = NormalizeJobEnum(j.OnMissed, "on_missed", j.Name, "skip", "run_once", "run_all");
+                    if (j.TimeoutSeconds <= 0) j.TimeoutSeconds = 3600;
+                    if (j.MissedGraceSeconds < 0) j.MissedGraceSeconds = 0;
+
+                    j.Command = Environment.ExpandEnvironmentVariables(j.Command);
+                    if (!string.IsNullOrEmpty(j.WorkingDirectory))
+                        j.WorkingDirectory = Environment.ExpandEnvironmentVariables(j.WorkingDirectory);
+
+                    c.Jobs.Add(j);
+                }
+            }
+
             return c;
+        }
+
+        private static void ApplyJob(JobConfig j, Dictionary<string, object> o)
+        {
+            j.Name = Str(o, "name", j.Name);
+            j.Enabled = Bool(o, "enabled", j.Enabled);
+            j.Cron = Str(o, "cron", j.Cron);
+            j.EverySeconds = Int(o, "every_seconds", j.EverySeconds);
+            j.Command = Str(o, "command", j.Command);
+            j.Args = StrList(o, "args", j.Args);
+            j.Shell = Str(o, "shell", j.Shell).ToLowerInvariant();
+            j.WorkingDirectory = Str(o, "working_directory", j.WorkingDirectory);
+            j.TimeoutSeconds = Int(o, "timeout_seconds", j.TimeoutSeconds);
+            j.IfRunning = Str(o, "if_running", j.IfRunning).ToLowerInvariant();
+            j.OnMissed = Str(o, "on_missed", j.OnMissed).ToLowerInvariant();
+            j.MissedGraceSeconds = Int(o, "missed_grace_seconds", j.MissedGraceSeconds);
+
+            Dictionary<string, object> env = Map(o, "env");
+            if (env != null)
+            {
+                foreach (KeyValuePair<string, object> kv in env)
+                {
+                    string v = kv.Value as string;
+                    if (v != null) j.Env[kv.Key] = v;
+                }
+            }
+        }
+
+        private static string NormalizeJobEnum(string value, string field, string jobName, params string[] allowed)
+        {
+            string v = (value ?? "").Trim().ToLowerInvariant();
+            foreach (string a in allowed) if (v == a) return v;
+            throw new Exception("job \"" + jobName + "\": \"" + field + "\" must be one of: " + string.Join(", ", allowed));
         }
 
         /// <summary>
