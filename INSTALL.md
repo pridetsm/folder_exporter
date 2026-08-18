@@ -54,7 +54,30 @@ Then check it:
 .\folder_exporter.exe --check-config
 ```
 
-That prints every folder it will watch and flags any that do not exist.
+That prints every folder it will watch and flags any that do not exist, and
+every job it will run.
+
+## 2b. (Optional) Add scheduled jobs
+
+If you have scripts that currently run under Task Scheduler and keep getting
+disturbed by preventive maintenance or configuration-management baselines,
+move them into the `jobs:` section instead - they then run inside this same
+service, which nothing that resets scheduled tasks touches. See
+[README.md - Job scheduling](README.md#job-scheduling) for the full
+reference; the short version:
+
+```yaml
+jobs:
+  - name: nightly_reconciliation
+    cron: "30 2 * * *"
+    command: C:\scripts\Reconcile.ps1
+```
+
+Test it immediately without waiting for 2:30am:
+
+```powershell
+.\folder_exporter.exe --run-job nightly_reconciliation
+```
 
 ## 3. Run it as a service
 

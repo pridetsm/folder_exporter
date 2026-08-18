@@ -8,10 +8,10 @@ using System.ServiceProcess;
 using System.Threading;
 
 [assembly: AssemblyTitle("folder_exporter")]
-[assembly: AssemblyDescription("Prometheus exporter for Windows file and folder metrics")]
+[assembly: AssemblyDescription("Prometheus exporter for Windows file and folder metrics, with a built-in job scheduler")]
 [assembly: AssemblyProduct("folder_exporter")]
-[assembly: AssemblyVersion("1.2.0.0")]
-[assembly: AssemblyFileVersion("1.2.0.0")]
+[assembly: AssemblyVersion("2.0.0.0")]
+[assembly: AssemblyFileVersion("2.0.0.0")]
 
 namespace FolderExporter
 {
@@ -24,6 +24,7 @@ namespace FolderExporter
         {
             string configPath = null;
             string serviceName = DefaultServiceName;
+            string runJob = null;
             bool forceConsole = false, install = false, uninstall = false;
             bool once = false, check = false;
 
@@ -43,6 +44,9 @@ namespace FolderExporter
                     case "uninstall": case "remove": uninstall = true; break;
                     case "once": once = true; break;
                     case "check-config": case "check": check = true; break;
+                    case "run-job":
+                        if (i + 1 < args.Length) runJob = args[++i];
+                        break;
                     case "version": case "v":
                         Console.WriteLine("folder_exporter " + Metrics.Version);
                         return 0;
@@ -74,18 +78,49 @@ namespace FolderExporter
                 try
                 {
                     Config c = Config.Load(configPath);
-                    Console.WriteLine("config OK: " + c.Folders.Count + " folder(s), listening on " + c.ListenAddress);
+                    Console.WriteLine("config OK: " + c.Folders.Count + " folder(s), " + c.Jobs.Count +
+                                       " job(s), listening on " + c.ListenAddress);
                     Console.WriteLine("host: " + Environment.MachineName);
                     foreach (FolderConfig t in c.Folders)
                     {
                         bool exists = Directory.Exists(t.Path);
                         Console.WriteLine("  - " + t.Name + " -> " + t.Path + (exists ? "" : "   [WARNING: path not found]"));
                     }
+                    if (c.Jobs.Count > 0)
+                    {
+                        Console.WriteLine("jobs:");
+                        foreach (JobConfig j in c.Jobs)
+                        {
+                            string schedule = j.EverySeconds > 0 ? "every " + j.EverySeconds + "s" : j.Cron;
+                            string enabled = j.Enabled ? "" : "   [disabled]";
+                            Console.WriteLine("  - " + j.Name + " (" + schedule + ") -> " + j.Command + enabled);
+                        }
+                    }
                     return 0;
                 }
                 catch (Exception ex)
                 {
                     Console.Error.WriteLine("config INVALID: " + ex.Message);
+                    return 1;
+                }
+            }
+
+            if (runJob != null)
+            {
+                try
+                {
+                    Log.Configure("info", "", 0, true);
+                    Config c = Config.Load(configPath);
+                    var scheduler = new Scheduler(Log);
+                    scheduler.LoadOnly(c);
+                    string message;
+                    bool ok = scheduler.RunJobOnceByName(runJob, out message);
+                    Console.WriteLine(message);
+                    return ok && message.StartsWith("ok") ? 0 : 1;
+                }
+                catch (Exception ex)
+                {
+                    Console.Error.WriteLine("error: " + ex.Message);
                     return 1;
                 }
             }
@@ -98,8 +133,11 @@ namespace FolderExporter
                     // exposition, or piping it into promtool/a file breaks. Console logging
                     // is therefore off; scan health is still reported by the metrics
                     // themselves (folder_up, folder_scan_errors_total, folder_scan_timed_out).
+                    // The job scheduler loads its state (so scheduler_job_* metrics render)
+                    // but does not run: a cron entry that scrapes via --once must not also
+                    // fire whatever job happens to be due during that brief window.
                     Log.Configure("warn", "", 0, false);
-                    var app = new App(configPath, false, Log);
+                    var app = new App(configPath, false, Log, false);
                     app.Start();
                     Console.Out.Write(app.ScanOnceAndRender());
                     app.Stop();
@@ -179,7 +217,7 @@ namespace FolderExporter
                          "\\\" --service-name \\\"" + serviceName + "\\\"";
             int rc = Sc("create " + serviceName + " binPath= \"" + bin + "\" start= auto DisplayName= \"Prometheus folder exporter\"");
             if (rc != 0) return rc;
-            Sc("description " + serviceName + " \"Exposes Windows file and folder metrics to Prometheus.\"");
+            Sc("description " + serviceName + " \"Exposes Windows file and folder metrics to Prometheus, and runs scheduled jobs defined in the config.\"");
             // Restart automatically on failure: 5s, 10s, then every 60s; reset counter daily.
             Sc("failure " + serviceName + " reset= 86400 actions= restart/5000/restart/10000/restart/60000");
             Console.WriteLine("Service '" + serviceName + "' installed.");
@@ -235,12 +273,15 @@ namespace FolderExporter
         private static void Usage()
         {
             Console.WriteLine(
-@"folder_exporter " + Metrics.Version + @" - Prometheus exporter for Windows file/folder metrics
+@"folder_exporter " + Metrics.Version + @" - Prometheus exporter for Windows file/folder
+metrics, with a built-in job scheduler (cron or interval jobs defined in the
+same config file, run as this service - no Task Scheduler dependency).
 
 Usage:
   folder_exporter.exe [--config <path>]      Run in the foreground (Ctrl+C to stop)
   folder_exporter.exe --once                 Scan once, print metrics to stdout, exit
   folder_exporter.exe --check-config         Validate the config file and exit
+  folder_exporter.exe --run-job <name>       Run one configured job immediately and exit
   folder_exporter.exe --install              Install as a Windows service (elevated)
   folder_exporter.exe --uninstall            Remove the Windows service (elevated)
   folder_exporter.exe --version              Print the version

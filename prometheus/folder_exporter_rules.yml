@@ -152,6 +152,59 @@ groups:
           description: "Add/remove counts are unreliable. Raise max_tracked_files or narrow the include filters."
 
   # -------------------------------------------------------------------------
+  # Job scheduler
+  # -------------------------------------------------------------------------
+  - name: folder_exporter_scheduler
+    rules:
+
+      - alert: SchedulerDown
+        expr: scheduler_up == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Job scheduler on {{ $labels.instance }} is not running"
+          description: "The folder_exporter service is up but its scheduler loop is not - scheduled jobs are not firing."
+
+      - alert: JobFailed
+        expr: increase(scheduler_job_runs_total{result="failed"}[1h]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "Job {{ $labels.job }} failed on {{ $labels.instance }}"
+          description: "Non-zero exit in the last hour. Check the job's log under job_log_directory."
+
+      - alert: JobTimedOut
+        expr: increase(scheduler_job_runs_total{result="timeout"}[1h]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "Job {{ $labels.job }} timed out on {{ $labels.instance }}"
+          description: "Hit timeout_seconds and was killed. Either the script hung or the timeout is too tight."
+
+      # Generic staleness fallback for a job with no natural cadence to compare
+      # against. Prefer a per-job alert keyed to that job's own schedule where
+      # you can - see the commented example below.
+      - alert: JobNeverSucceeded
+        expr: scheduler_job_runs_total{result="ok"} == 0 and scheduler_job_last_end_timestamp_seconds > 0
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Job {{ $labels.job }} on {{ $labels.instance }} has never completed successfully"
+
+      # Example: alert if a specific daily job has not succeeded in 25 hours.
+      # Copy and adjust per job - a generic "hasn't run in N seconds" rule
+      # cannot know each job's own expected cadence.
+      #
+      # - alert: NightlyReconciliationStale
+      #   expr: time() - scheduler_job_last_success_timestamp_seconds{job="nightly_reconciliation"} > 90000
+      #   labels:
+      #     severity: critical
+      #   annotations:
+      #     summary: "nightly_reconciliation has not succeeded in over 25 hours"
+
+  # -------------------------------------------------------------------------
   # Recording rules: precompute the expressions dashboards query most often.
   # -------------------------------------------------------------------------
   - name: folder_exporter_recording

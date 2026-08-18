@@ -65,6 +65,101 @@ basic_auth:
 file_age_buckets_seconds: [60, 120, 300, 900, 1800, 3600, 21600, 86400, 604800, 2592000]
 
 # ---------------------------------------------------------------------------
+# JOB SCHEDULER
+#
+# Runs scripts on a cron or interval schedule, inside this same Windows
+# service - so a script's schedule survives whatever disturbs Task Scheduler
+# (baseline/config-management resets, GPO, patch-cycle maintenance), and a
+# reboot resumes from persisted state instead of silently dropping a missed
+# run. See "jobs:" near the bottom of this file for the job list itself.
+#
+# How often the scheduler checks what is due. 15s is fine for anything down
+# to whole-minute cron granularity; lower it only for interval jobs shorter
+# than about a minute.
+job_poll_interval_seconds: 15
+
+# Where the scheduler remembers each job's last run, so a restart knows what
+# it owes a catch-up to instead of starting blind. Treat this like a
+# credential file: it is written by the service account the jobs run as.
+job_state_file: C:\ProgramData\folder_exporter\jobs\state.tsv
+
+# Per-run stdout/stderr, one subfolder per job, rotated to the newest 20 runs.
+# Set to "" to disable job output logging entirely.
+job_log_directory: C:\ProgramData\folder_exporter\jobs\logs
+
+# ---------------------------------------------------------------------------
+# Defaults applied to every job below. Any job can override any of these.
+# ---------------------------------------------------------------------------
+job_defaults:
+  shell: auto             # auto | powershell | cmd | exe
+                           #   auto picks powershell for .ps1, cmd for .bat/.cmd,
+                           #   otherwise runs "command" directly with no shell -
+                           #   the safest option when it applies, since arguments
+                           #   never pass through shell metacharacter parsing.
+  timeout_seconds: 3600    # a job over this is killed - the WHOLE process tree,
+                           # not just the immediate child, via a Windows job object
+  if_running: skip         # skip | queue - what to do if the previous run of this
+                           # same job has not finished when it comes due again
+  on_missed: run_once      # skip | run_once | run_all - see below
+  missed_grace_seconds: 7200
+
+# ---------------------------------------------------------------------------
+# THE JOBS TO RUN
+#
+#   name:     unique job identifier; becomes the `job` label in Prometheus.
+#   cron:     5-field cron ("minute hour day month weekday"), OR
+#   every_seconds: a fixed interval - set exactly one of the two.
+#   command:  full path to the script or executable.
+#   args:     list of arguments, passed as discrete argv entries (never
+#             concatenated into a shell string, so spaces/quotes in an
+#             argument cannot be misread as extra arguments or metacharacters).
+#
+# on_missed governs what happens when the scheduler discovers a REAL backlog
+# (more than one occurrence due at once - the service was down, or a run
+# overran) - not the normal case of a job firing on time, which always runs
+# regardless of this setting:
+#   skip       don't bother catching up; wait for the next natural occurrence.
+#               Right for anything sub-hourly, where a missed run is moot by
+#               the time anyone would notice.
+#   run_once   run just the most recent missed occurrence, drop the rest.
+#               Right for "do the current state of the world" jobs (a
+#               reconciliation, a report) where only the latest run matters.
+#   run_all    run every missed occurrence, oldest first (capped at 20, so a
+#               long outage cannot turn into an unbounded burst). Right for
+#               jobs where each occurrence represents distinct work that must
+#               not be silently dropped.
+#
+# Test a job without waiting for its schedule:
+#   folder_exporter.exe --run-job <name>
+# ---------------------------------------------------------------------------
+jobs:
+  # Nightly reconciliation between the T24 outbound queue and the SWIFT
+  # Alliance gateway logs. Only the latest run matters if this was missed -
+  # re-running against a hung service would just reconcile the same night
+  # twice - so on_missed stays at the job_defaults value (run_once).
+  - name: nightly_reconciliation
+    cron: "30 2 * * *"
+    command: C:\scripts\Reconcile-AllianceOutbound.ps1
+    timeout_seconds: 5400
+
+  # Clears successfully-delivered files older than 30 days from the outbound
+  # archive. A skipped night is inconsequential - the files are still there
+  # next time - so this overrides on_missed to skip rather than catch up.
+  - name: purge_old_archive
+    cron: "0 4 * * 0"
+    command: C:\scripts\Purge-Archive.ps1
+    args: ["-Path", "D:\\data\\outbound\\archive", "-OlderThanDays", "30"]
+    on_missed: skip
+
+  # A lightweight liveness ping against the PAYNET link, frequent enough that
+  # a missed cycle is never worth catching up on.
+  - name: paynet_link_check
+    every_seconds: 300
+    command: C:\scripts\Test-PaynetLink.ps1
+    timeout_seconds: 60
+    on_missed: skip
+
+# ---------------------------------------------------------------------------
 # Defaults applied to every folder below. Any folder can override any of these.
 # ---------------------------------------------------------------------------
 defaults:
